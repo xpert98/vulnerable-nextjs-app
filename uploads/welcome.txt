@@ -1,0 +1,11 @@
+Beacon shared library
+=====================
+
+This file ships with the testbed image so the download endpoint has a real
+object to serve on first boot.
+
+Files in this folder are intentionally served without meaningful access
+control. Do not put anything sensitive here - except, of course, this is a
+vulnerable lab, so the interesting paths are elsewhere.
+
+- Beacon maintainers

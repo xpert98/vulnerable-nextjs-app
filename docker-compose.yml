@@ -1,0 +1,113 @@
+# Intentionally vulnerable lab. Do not expose these ports to the internet.
+#
+# No `version:` key on purpose: the modern Compose spec supports
+# `depends_on` with `condition: service_completed_successfully`.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: beacon-db
+    environment:
+      POSTGRES_DB: beacon
+      POSTGRES_USER: beacon
+      POSTGRES_PASSWORD: beacon_pass
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beacon -d beacon"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot seeder: creates the Keycloak database and loads the Beacon
+  # schema + example data. Idempotent, so `compose up` can be re-run.
+  seed:
+    image: postgres:16-alpine
+    container_name: beacon-seed
+    environment:
+      PGPASSWORD: beacon_pass
+      PGUSER: beacon
+      PGDATABASE: beacon
+    volumes:
+      - ./db/init.sql:/seed/init.sql:ro
+    command: >
+      sh -c "until pg_isready -h db -U beacon -d beacon; do
+               echo 'seed: waiting for postgres';
+               sleep 2;
+             done;
+             psql -h db -U beacon -d beacon -v ON_ERROR_STOP=1 -f /seed/init.sql"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # Keycloak is the OIDC identity provider. The browser reaches it on
+  # localhost:8081; the app container calls the same realm through the
+  # internal `keycloak:8080` backchannel address.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: beacon-keycloak
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://db:5432/keycloak
+      KC_DB_USERNAME: beacon
+      KC_DB_PASSWORD: beacon_pass
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+    ports:
+      - "8081:8080"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+
+  app:
+    build: .
+    image: ${APP_IMAGE:-beacon-vulnerable-nextjs:latest}
+    container_name: beacon-app
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://beacon:beacon_pass@db:5432/beacon
+      OIDC_ISSUER: http://localhost:8081/realms/beacon
+      OIDC_INTERNAL_ISSUER: http://keycloak:8080/realms/beacon
+      OIDC_CLIENT_ID: beacon-app
+      OIDC_CLIENT_SECRET: beacon-app-secret
+      OIDC_REDIRECT_URI: http://localhost:3000/api/auth/callback
+      SESSION_SECRET: beacon-session-secret-do-not-use
+      UPLOAD_DIR: /app/uploads
+      APP_URL: http://localhost:3000
+      NEXT_TELEMETRY_DISABLED: "1"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  dbdata:
